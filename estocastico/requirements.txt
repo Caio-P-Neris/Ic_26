@@ -1,0 +1,12 @@
+numpy 
+yfinance 
+scipy 
+tqdm 
+python-bcb
+scikit-learn
+jinja2
+matplotlib
+plotly 
+nbformat
+pypfopt
+PyPortfolioOpt

@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-ibov_wayback.py  (v2 — download direto do CSV)
+ibov_wayback.py  (v3 — HTML/iframe + JSON API)
 ═══════════════════════════════════════════════
-Coleta a composição quadrimestral do IBOV (2018-2025) via Wayback Machine,
-priorizando o download direto do arquivo CSV que existe na página B3.
+Coleta a composição quadrimestral do IBOV (2018-2025) via Wayback Machine.
 
-Estratégias por ordem de prioridade:
-  1. CSV download — sistemaswebb3 (URLs descobertas via CDX, ~2020+)
-  2. CSV download — CDX ao vivo por data (API sistemaswebb3)
-  3. CSV legado   — URLs B3/BM&FBovespa antigas (lumis, data/files)
-  4. JSON paginado — API sistemaswebb3 (todas as páginas, fallback)
-  5. HTML parse   — página principal B3 (último recurso)
+A página da B3 embute o conteúdo em um iframe apontando para
+sistemaswebb3-listados.b3.com.br. O Wayback Machine arquiva o iframe
+como URL separada, onde está a tabela com class="table table-responsive-md".
 
-Roda primeiro uma fase de DESCOBERTA via CDX para mapear quais URLs
-de CSV existem no arquivo do WM, depois usa essa lista na coleta.
+Estratégias por ordem:
+  1. JSON API   — sistemaswebb3/GetPortfolioDay  (2021+, confirmado)
+  2. HTML iframe — página principal → extrai src do iframe → WM → BeautifulSoup
+  3. HTML direto — busca URL do iframe diretamente no CDX (sem passar pela página pai)
+  4. HTML página — tenta a página principal como fallback (captura server-side render)
+
+Dependências:
+  pip install requests pandas beautifulsoup4 lxml openpyxl
 
 Uso:
-  pip install requests pandas openpyxl
   python ibov_wayback.py
   python ibov_wayback.py --skip-existing
-  python ibov_wayback.py --only 2021-Q2
-  python ibov_wayback.py --discover-only     # só mostra URLs encontradas
-  python ibov_wayback.py --rediscover        # refaz a varredura CDX
+  python ibov_wayback.py --only 2019-Q1
+  python ibov_wayback.py --rediscover
 """
 
 import argparse
@@ -34,9 +34,11 @@ import sys
 import time
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -45,51 +47,48 @@ from urllib3.util.retry import Retry
 # Configurações
 # ══════════════════════════════════════════════════════════════════════════════
 
-CDX_API  = "https://web.archive.org/cdx/search/cdx"
-WB_BASE  = "https://web.archive.org/web"
+CDX_API = "https://web.archive.org/cdx/search/cdx"
+WB_BASE = "https://web.archive.org/web"
 
-# API nova B3 (~2020+) — retorna JSON paginado E CSV via download
-B3_API_NEW_PREFIX = (
-    "https://sistemaswebb3-listados.b3.com.br"
-    "/indexProxy/indexCall/GetPortfolioDay/"
-)
-
-# Página principal (fallback HTML)
+# Página principal da carteira IBOV
 B3_PAGE = (
     "https://www.b3.com.br/pt_br/market-data-e-indices/indices/"
     "indices-amplos/indice-ibovespa-ibovespa-composicao-da-carteira.htm"
 )
 
-# Padrões legados de URL (2018-2019, BM&FBovespa / B3 antiga)
-B3_LEGACY_PREFIXES = [
-    "https://www.b3.com.br/lumis/portal/file/fileDownload.jsp",
-    "https://www.b3.com.br/data/files/",
-    "https://www.bmfbovespa.com.br/indices/download/",
-    "https://www.bmfbovespa.com.br/lumis/portal/file/fileDownload.jsp",
-    "https://www.b3.com.br/pt_br/market-data-e-indices/indices/indices-amplos/",
-]
+# API JSON paginada (vigente ~2020+, 59 snapshots confirmados no WM)
+B3_API_PREFIX = (
+    "https://sistemaswebb3-listados.b3.com.br"
+    "/indexProxy/indexCall/GetPortfolioDay/"
+)
+
+# Prefixo do iframe — o WM arquivou essa URL separadamente
+IFRAME_PREFIX = "https://sistemaswebb3-listados.b3.com.br/indexPage/"
+
+# Classe CSS da tabela de composição (confirmada na inspeção)
+TABLE_CLASS = "table-responsive-md"   # substring que identifica a tabela certa
 
 OUTPUT_DIR      = "ibov_composicao"
 OUTPUT_CSV      = os.path.join(OUTPUT_DIR, "ibov_quadrimestral_2018_2025.csv")
 OUTPUT_XLSX     = os.path.join(OUTPUT_DIR, "ibov_quadrimestral_2018_2025.xlsx")
-DISCOVERY_CACHE = os.path.join(OUTPUT_DIR, "_discovered_urls.json")
+IFRAME_CACHE    = os.path.join(OUTPUT_DIR, "_iframe_urls.json")
 
-DELAY   = 2    # segundos entre requests (respeitar WM)
-MAX_RET = 3    # tentativas de retry HTTP
-CDX_WIN = 60   # dias de tolerância padrão para snapshot
+DELAY   = 2     # segundos entre requests ao WM
+MAX_RET = 3
+CDX_WIN = 60    # dias de tolerância padrão
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/csv,application/json,text/html,*/*;q=0.8",
+    "Accept": "text/html,application/json,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Session HTTP com retry automático
+# Session HTTP
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_session() -> requests.Session:
@@ -106,7 +105,7 @@ SESSION = build_session()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Datas dos quadrimestres (jan / mai / set de 2018 a 2025)
+# Datas dos quadrimestres
 # ══════════════════════════════════════════════════════════════════════════════
 
 QUADRIMESTRES: list[dict] = [
@@ -115,7 +114,7 @@ QUADRIMESTRES: list[dict] = [
         "ano":       y,
         "quad":      q,
         "mes":       m,
-        "data_alvo": datetime(y, m, 10),   # dia 10 = carteira já publicada
+        "data_alvo": datetime(y, m, 10),
     }
     for y in range(2018, 2026)
     for q, m in [(1, 1), (2, 5), (3, 9)]
@@ -128,7 +127,6 @@ QUADRIMESTRES: list[dict] = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cdx_query(params: dict, timeout: int = 45) -> list[list]:
-    """Executa uma consulta CDX e retorna as linhas (sem cabeçalho)."""
     try:
         r = SESSION.get(CDX_API, params=params, timeout=timeout)
         r.raise_for_status()
@@ -146,10 +144,7 @@ def cdx_find_snapshot(
     match_type: str = "exact",
     mime_filter: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Retorna o timestamp WM (YYYYMMDDHHMMSS) do snapshot 200 mais próximo de
-    `target` dentro de `window_days` dias. None se não encontrar.
-    """
+    """Retorna o timestamp WM mais próximo de `target` dentro de `window_days`."""
     filters = ["statuscode:200"]
     if mime_filter:
         filters.append(f"mimetype:{mime_filter}")
@@ -165,109 +160,76 @@ def cdx_find_snapshot(
     }
     for row in cdx_query(params):
         ts = row[0]
-        snap_dt = datetime.strptime(ts[:8], "%Y%m%d")
-        if abs((snap_dt - target).days) <= window_days:
+        if abs((datetime.strptime(ts[:8], "%Y%m%d") - target).days) <= window_days:
             return ts
     return None
 
 
-def cdx_list_all(url_prefix: str, mime_filter: Optional[str] = None,
-                 limit: int = 5000) -> list[dict]:
-    """
-    Lista todos os snapshots arquivados (status 200) para um prefixo de URL.
-    collapse=urlkey → uma entrada por URL única (evita duplicatas de snapshots).
-    """
+def cdx_list_prefix(url_prefix: str, limit: int = 3000) -> list[dict]:
+    """Lista todos os snapshots 200 para um prefixo de URL (collapse por URL única)."""
     params = {
         "url":       url_prefix,
         "output":    "json",
-        "fl":        "timestamp,original,mimetype,statuscode",
+        "fl":        "timestamp,original,mimetype",
         "filter":    ["statuscode:200"],
         "matchType": "prefix",
         "limit":     limit,
         "collapse":  "urlkey",
     }
-    if mime_filter:
-        params["filter"].append(f"mimetype:{mime_filter}")
-
     rows = cdx_query(params, timeout=90)
     return [{"timestamp": r[0], "url": r[1], "mimetype": r[2]} for r in rows]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Fase de descoberta — mapeia URLs de CSV/JSON do IBOV no Wayback Machine
+# Descoberta das URLs de iframe arquivadas
 # ══════════════════════════════════════════════════════════════════════════════
 
-def discover_ibov_urls(force: bool = False) -> dict:
+def discover_iframe_urls(force: bool = False) -> list[dict]:
     """
-    Varre o CDX para encontrar URLs B3 relacionadas ao IBOV arquivadas.
-    Resultado salvo em cache JSON para evitar reprocessamento.
-
-    Retorna:
-      {
-        "csv_new":    [...],   # CSV via API sistemaswebb3
-        "json_new":   [...],   # JSON via API sistemaswebb3
-        "csv_legacy": [...],   # CSV/arquivos legados B3
-      }
+    Mapeia todas as URLs do iframe sistemaswebb3/indexPage arquivadas no WM.
+    Essas são as URLs que contêm a tabela HTML da composição IBOV.
+    Resultado em cache para evitar reprocessamento.
     """
-    if not force and os.path.isfile(DISCOVERY_CACHE):
-        with open(DISCOVERY_CACHE, encoding="utf-8") as f:
+    if not force and os.path.isfile(IFRAME_CACHE):
+        with open(IFRAME_CACHE, encoding="utf-8") as f:
             cached = json.load(f)
-        total = sum(len(v) for v in cached.values())
-        print(f"  📂  Cache de descoberta carregado ({total} entradas): {DISCOVERY_CACHE}")
+        print(f"  📂  Cache iframe carregado ({len(cached)} entradas): {IFRAME_CACHE}")
         return cached
 
-    print("\n" + "═"*60)
-    print("  FASE DE DESCOBERTA — varredura CDX")
-    print("═"*60)
+    print("\n  🔍  Descobrindo URLs de iframe no Wayback Machine …")
+    entries = cdx_list_prefix(IFRAME_PREFIX)
 
-    result: dict = {"csv_new": [], "json_new": [], "csv_legacy": []}
+    # Filtra entradas relevantes: HTML e que contenham "ibov" ou "ibovespa" na URL
+    filtered = [
+        e for e in entries
+        if any(kw in e["url"].lower() for kw in ["ibov", "ibovespa", "indice"])
+        or "text/html" in e.get("mimetype", "")
+    ]
 
-    # ── API nova: CSV ─────────────────────────────────────────────────────
-    print(f"\n  [1/3] CSV em {B3_API_NEW_PREFIX[:55]} …")
-    hits = cdx_list_all(B3_API_NEW_PREFIX, mime_filter="text/csv")
-    result["csv_new"] = hits
-    print(f"        → {len(hits)} snapshots CSV")
-    time.sleep(DELAY)
+    # Se não filtrou nada relevante, mantém tudo (pode ter URL genérica)
+    result = filtered if filtered else entries
 
-    # ── API nova: JSON ────────────────────────────────────────────────────
-    print(f"  [2/3] JSON em {B3_API_NEW_PREFIX[:55]} …")
-    hits_j = cdx_list_all(B3_API_NEW_PREFIX, mime_filter="application/json")
-    result["json_new"] = hits_j
-    print(f"        → {len(hits_j)} snapshots JSON")
-    time.sleep(DELAY)
-
-    # ── URLs legadas ──────────────────────────────────────────────────────
-    print("  [3/3] URLs legadas B3/BM&FBovespa …")
-    for pfx in B3_LEGACY_PREFIXES:
-        hits_leg = cdx_list_all(pfx)
-        # Filtra por palavras-chave relacionadas ao IBOV
-        keywords = ["ibov", "composicao", "carteira", "portfolio", "indice"]
-        filtered = [
-            h for h in hits_leg
-            if any(kw in h["url"].lower() for kw in keywords)
-        ]
-        result["csv_legacy"].extend(filtered)
-        print(f"        {pfx[:55]:55s}  → {len(filtered)}/{len(hits_leg)}")
-        time.sleep(DELAY)
-
-    # Remove duplicatas em csv_legacy
-    seen = set()
-    unique_legacy = []
-    for e in result["csv_legacy"]:
-        key = e["url"]
-        if key not in seen:
-            seen.add(key)
-            unique_legacy.append(e)
-    result["csv_legacy"] = unique_legacy
-
-    # Salva cache
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(DISCOVERY_CACHE, "w", encoding="utf-8") as f:
+    with open(IFRAME_CACHE, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    total = sum(len(v) for v in result.values())
-    print(f"\n  💾  Cache salvo: {DISCOVERY_CACHE}  ({total} entradas totais)")
+    print(f"  💾  {len(result)} URLs de iframe salvas em {IFRAME_CACHE}")
     return result
+
+
+def closest_iframe(entries: list[dict], target: datetime,
+                   window_days: int = CDX_WIN) -> Optional[dict]:
+    """Retorna a entrada descoberta mais próxima de `target`."""
+    best, best_delta = None, window_days + 1
+    for e in entries:
+        try:
+            dt    = datetime.strptime(e["timestamp"][:8], "%Y%m%d")
+            delta = abs((dt - target).days)
+            if delta < best_delta:
+                best_delta, best = delta, e
+        except Exception:
+            pass
+    return best
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -275,54 +237,138 @@ def discover_ibov_urls(force: bool = False) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def wayback_get(url: str, timestamp: str) -> Optional[bytes]:
-    """
-    Baixa o recurso arquivado e retorna os bytes brutos.
-    Usa sufixo `if_` para obter o recurso puro (sem toolbar do WM).
-    """
+    """Baixa o recurso arquivado (sufixo if_ = sem toolbar do WM)."""
     wb_url = f"{WB_BASE}/{timestamp}if_/{url}"
     try:
         r = SESSION.get(wb_url, timeout=90)
-        if r.status_code == 200 and len(r.content) > 100:
+        if r.status_code == 200 and len(r.content) > 200:
             return r.content
-        print(f"      [WB] status={r.status_code}  size={len(r.content)}")
+        print(f"      [WB] status={r.status_code}  bytes={len(r.content)}")
     except Exception as exc:
-        print(f"      [WB GET] {exc}")
+        print(f"      [WB] {exc}")
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Parsers
+# Extração do src do iframe na página principal
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_csv_bytes(data: bytes) -> Optional[pd.DataFrame]:
+def extract_iframe_src(html_bytes: bytes) -> Optional[str]:
     """
-    Tenta ler bytes como CSV.
-    B3 usa ponto-e-vírgula como separador e vírgula como decimal.
-    Testa múltiplas combinações de encoding e separador.
+    Encontra a URL do iframe na página principal da B3.
+    Procura por <iframe> e <object> que apontem para sistemaswebb3 ou b3.com.br.
     """
-    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
-        for sep in (";", ",", "\t"):
-            try:
-                text = data.decode(enc)
-                df = pd.read_csv(
-                    io.StringIO(text),
-                    sep=sep,
-                    decimal=",",
-                    thousands=".",
-                    engine="python",
-                    on_bad_lines="skip",
-                )
-                if df.shape[1] >= 2 and df.shape[0] >= 5:
-                    df = normalize_df(df)
-                    if "codigo" in df.columns and not df.empty:
-                        return df
-            except Exception:
-                pass
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            html = html_bytes.decode(enc)
+            break
+        except Exception:
+            html = None
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1. <iframe src="...">
+    for tag in soup.find_all("iframe"):
+        src = tag.get("src", "")
+        if src and ("sistemaswebb3" in src or "b3.com.br" in src):
+            return src if src.startswith("http") else "https:" + src
+
+    # 2. <object data="..."> ou <embed src="...">
+    for tag in soup.find_all(["object", "embed"]):
+        src = tag.get("data", tag.get("src", ""))
+        if src and "b3.com.br" in src:
+            return src if src.startswith("http") else "https:" + src
+
+    # 3. URLs de iframe em scripts JS inline (às vezes injetado via JS)
+    matches = re.findall(
+        r"""(?:src|url|iframe)['":\s]+(['"](https?://sistemaswebb3[^'"]+)['")])""",
+        html, re.IGNORECASE
+    )
+    if matches:
+        return matches[0][1] if isinstance(matches[0], tuple) else matches[0]
+
     return None
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parser HTML — BeautifulSoup na tabela conhecida
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_table_bs4(html_bytes: bytes) -> Optional[pd.DataFrame]:
+    """
+    Usa BeautifulSoup para encontrar a tabela de composição IBOV.
+    Procura por class="table table-responsive-sm table-responsive-md"
+    e faz o parse linha a linha.
+    """
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            html = html_bytes.decode(enc)
+            break
+        except Exception:
+            html = None
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # Tenta encontrar a tabela pela classe confirmada na inspeção
+    table = (
+        soup.find("table", class_=lambda c: c and TABLE_CLASS in c)
+        or soup.find("table", class_=lambda c: c and "table-responsive" in (c or ""))
+        or soup.find("table")   # fallback: primeira tabela encontrada
+    )
+
+    if table is None:
+        # Pode haver iframes aninhados no próprio HTML arquivado
+        nested_docs = soup.find_all("html")
+        for doc in nested_docs:
+            table = doc.find("table", class_=lambda c: c and "table" in (c or ""))
+            if table:
+                break
+
+    if table is None:
+        return None
+
+    # Cabeçalho
+    thead = table.find("thead")
+    headers = []
+    if thead:
+        headers = [th.get_text(strip=True) for th in thead.find_all(["th", "td"])]
+
+    # Linhas do corpo
+    tbody = table.find("tbody")
+    rows  = []
+    if tbody:
+        for tr in tbody.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            if cells and any(c for c in cells):   # ignora linhas vazias
+                rows.append(cells)
+
+    if not rows:
+        return None
+
+    try:
+        if headers and len(headers) == len(rows[0]):
+            df = pd.DataFrame(rows, columns=headers)
+        else:
+            df = pd.DataFrame(rows)
+            # Usa primeira linha como cabeçalho se parecer um header
+            if df.shape[0] > 1 and all(isinstance(v, str) for v in df.iloc[0]):
+                df.columns = df.iloc[0]
+                df = df.iloc[1:].reset_index(drop=True)
+    except Exception:
+        return None
+
+    return normalize_df(df)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parser JSON (API sistemaswebb3)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_json_bytes(data: bytes) -> Optional[pd.DataFrame]:
-    """Interpreta bytes como JSON da API sistemaswebb3."""
     try:
         raw = json.loads(data.decode("utf-8"))
     except Exception:
@@ -344,57 +390,7 @@ def parse_json_bytes(data: bytes) -> Optional[pd.DataFrame]:
     if not results:
         return None
 
-    df = pd.DataFrame(results)
-    return normalize_df(df)
-
-
-def parse_html_bytes(data: bytes) -> Optional[pd.DataFrame]:
-    """
-    Parse do HTML da página B3.
-    Tenta extrair JSON embutido nos scripts da página e, depois,
-    tabelas HTML convencionais.
-    """
-    html = None
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            html = data.decode(enc)
-            break
-        except Exception:
-            pass
-    if not html:
-        return None
-
-    # 1. JSON embutido no JS da página
-    json_patterns = [
-        r'"results"\s*:\s*(\[\s*\{.*?\}\s*\])',
-        r'"portfolioDay"\s*:\s*(\[\s*\{.*?\}\s*\])',
-        r'"composition"\s*:\s*(\[\s*\{.*?\}\s*\])',
-        r'(\[\s*\{"cod"\s*:.*?\}\s*\])',
-    ]
-    for pat in json_patterns:
-        m = re.search(pat, html, re.DOTALL | re.IGNORECASE)
-        if m:
-            try:
-                df = pd.DataFrame(json.loads(m.group(1)))
-                df = normalize_df(df)
-                if "codigo" in df.columns and len(df) >= 5:
-                    return df
-            except Exception:
-                pass
-
-    # 2. Tabelas HTML
-    try:
-        tables = pd.read_html(html, decimal=",", thousands=".")
-        for t in tables:
-            joined = " ".join(str(c).lower() for c in t.columns)
-            if any(kw in joined for kw in ["cod", "papel", "ativo", "participação"]):
-                t = normalize_df(t)
-                if "codigo" in t.columns and len(t) >= 5:
-                    return t
-    except Exception:
-        pass
-
-    return None
+    return normalize_df(pd.DataFrame(results))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -402,36 +398,26 @@ def parse_html_bytes(data: bytes) -> Optional[pd.DataFrame]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _COL_MAP = {
-    # código do ativo
     "cod": "codigo", "codRaw": "codigo", "asset": "codigo",
-    "Cod": "codigo", "COD": "codigo", "Asset": "codigo",
-    "Código": "codigo", "Papel": "codigo", "ticker": "codigo", "Ativo": "codigo",
-    # nome da empresa
-    "Ação": "nome", "Empresa": "nome", "name": "nome", "Name": "nome",
-    # participação %
-    "part": "part_pct", "Part": "part_pct", "PART": "part_pct",
-    "participation": "part_pct", "percentual": "part_pct",
-    "Participação": "part_pct", "Participacao": "part_pct",
-    "Part. (%)": "part_pct", "Part.(%)": "part_pct",
-    "Peso": "part_pct", "weight": "part_pct",
-    # quantidade teórica
+    "Cod": "codigo", "COD": "codigo", "Código": "codigo",
+    "Papel": "codigo", "ticker": "codigo", "Ativo": "codigo",
+    "Ação": "nome", "Empresa": "nome", "name": "nome",
+    "part": "part_pct", "Part": "part_pct",
+    "Participação": "part_pct", "Part. (%)": "part_pct",
+    "Peso": "part_pct", "participation": "part_pct",
     "theoricQty": "qtd_teorica", "TheoricQty": "qtd_teorica",
     "Qtde. Teórica": "qtd_teorica", "Quantidade Teórica": "qtd_teorica",
-    "qtdTeorica": "qtd_teorica",
-    # tipo / segmento
     "type": "tipo", "Type": "tipo", "Tipo": "tipo",
-    "setor": "segmento", "segment": "segmento",
-    "Segment": "segmento", "Segmento": "segmento",
+    "setor": "segmento", "segment": "segmento", "Segmento": "segmento",
 }
 
-_INVALID_CODES = {"COD", "CÓDIGO", "PAPEL", "ATIVO", "TICKER", "NAN", "CÓDIGO"}
+_INVALID = {"COD", "CÓDIGO", "PAPEL", "ATIVO", "TICKER", "NAN", ""}
 
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df = df.rename(columns={k: v for k, v in _COL_MAP.items() if k in df.columns})
 
-    # Fallback: detecta coluna de código por substring
     if "codigo" not in df.columns:
         for col in df.columns:
             if any(kw in str(col).lower() for kw in ["cod", "papel", "ativo", "ticker"]):
@@ -440,46 +426,22 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     if "codigo" in df.columns:
         df["codigo"] = df["codigo"].astype(str).str.strip().str.upper()
-        df = df[df["codigo"].notna() & (df["codigo"] != "") & (df["codigo"] != "NAN")]
-        df = df[~df["codigo"].isin(_INVALID_CODES)]
+        df = df[~df["codigo"].isin(_INVALID) & df["codigo"].notna()]
 
     return df.reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Builder de URLs da API B3
+# Builder URL JSON API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def b3_api_url(page: int = 1, page_size: int = 150) -> str:
-    """Gera URL da API sistemaswebb3 com parâmetros codificados em base64."""
     params = json.dumps(
         {"language": "pt-br", "pageNumber": page, "pageSize": page_size,
          "index": "IBOV", "segment": "1"},
         separators=(",", ":"),
     )
-    return B3_API_NEW_PREFIX + base64.b64encode(params.encode()).decode()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Seleciona snapshot mais próximo dentre descobertos
-# ══════════════════════════════════════════════════════════════════════════════
-
-def closest_entry(entries: list[dict], target: datetime,
-                  window_days: int = CDX_WIN) -> Optional[dict]:
-    """
-    Dentre uma lista de entradas descobertas {timestamp, url, …},
-    retorna a mais próxima de `target` dentro de `window_days` dias.
-    """
-    best, best_delta = None, window_days + 1
-    for e in entries:
-        try:
-            dt    = datetime.strptime(e["timestamp"][:8], "%Y%m%d")
-            delta = abs((dt - target).days)
-            if delta < best_delta:
-                best_delta, best = delta, e
-        except Exception:
-            pass
-    return best
+    return B3_API_PREFIX + base64.b64encode(params.encode()).decode()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -487,11 +449,11 @@ def closest_entry(entries: list[dict], target: datetime,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_quarter(
-    quad: dict, discovered: dict
+    quad: dict, iframe_entries: list[dict]
 ) -> tuple[Optional[pd.DataFrame], Optional[str], str]:
     """
-    Tenta obter a composição IBOV para o quadrimestre usando 5 estratégias.
-    Retorna (DataFrame, timestamp_WM, nome_da_estratégia).
+    Tenta 4 estratégias para obter a composição do IBOV no quadrimestre.
+    Retorna (DataFrame, timestamp_WM, estratégia_usada).
     """
     label  = quad["label"]
     target = quad["data_alvo"]
@@ -500,86 +462,22 @@ def fetch_quarter(
     print(f"  📅  {label}  |  alvo: {target.strftime('%d/%m/%Y')}")
     print(f"{'─'*60}")
 
-    # ── [1] CSV descoberto — API sistemaswebb3 ────────────────────────────
-    print("  [1] CSV download (URLs descobertas — API nova) …")
-    entry = closest_entry(discovered.get("csv_new", []), target)
-    if entry:
-        snap_dt = datetime.strptime(entry["timestamp"][:8], "%Y%m%d")
-        delta   = abs((snap_dt - target).days)
-        print(f"      snapshot: {entry['timestamp']}  ({snap_dt.strftime('%d/%m/%Y')}, Δ={delta}d)")
-        data = wayback_get(entry["url"], entry["timestamp"])
-        time.sleep(DELAY)
-        if data:
-            df = parse_csv_bytes(data)
-            if df is not None and not df.empty:
-                print(f"      ✅  {len(df)} ativos  (CSV direto — API nova)")
-                return df, entry["timestamp"], "csv_api_nova"
-    else:
-        print("      Sem entradas CSV descobertas para esta época.")
-
-    # ── [2] CSV ao vivo via CDX por data — API sistemaswebb3 ──────────────
-    print("  [2] CSV download (CDX ao vivo — API nova) …")
-    ts = cdx_find_snapshot(B3_API_NEW_PREFIX, target,
-                           match_type="prefix", mime_filter="text/csv")
-    time.sleep(1)
-    if ts:
-        snap_dt = datetime.strptime(ts[:8], "%Y%m%d")
-        print(f"      snapshot: {ts}  ({snap_dt.strftime('%d/%m/%Y')})")
-        # Recupera a URL real desse timestamp
-        rows = cdx_query({
-            "url": B3_API_NEW_PREFIX, "output": "json",
-            "from": ts, "to": ts,
-            "fl": "timestamp,original",
-            "matchType": "prefix",
-            "filter": ["statuscode:200", "mimetype:text/csv"],
-            "limit": 1,
-        })
-        real_url = rows[0][1] if rows else b3_api_url()
-        data = wayback_get(real_url, ts)
-        time.sleep(DELAY)
-        if data:
-            df = parse_csv_bytes(data)
-            if df is not None and not df.empty:
-                print(f"      ✅  {len(df)} ativos  (CSV CDX ao vivo)")
-                return df, ts, "csv_cdx_live"
-
-    # ── [3] CSV legado (URLs descobertas) ─────────────────────────────────
-    print("  [3] CSV legado B3 (lumis / data/files / bmfbovespa) …")
-    entry_leg = closest_entry(discovered.get("csv_legacy", []), target)
-    if entry_leg:
-        snap_dt = datetime.strptime(entry_leg["timestamp"][:8], "%Y%m%d")
-        delta   = abs((snap_dt - target).days)
-        print(f"      snapshot: {entry_leg['timestamp']}  ({snap_dt.strftime('%d/%m/%Y')}, Δ={delta}d)")
-        print(f"      URL: {entry_leg['url'][:75]}")
-        data = wayback_get(entry_leg["url"], entry_leg["timestamp"])
-        time.sleep(DELAY)
-        if data:
-            df = parse_csv_bytes(data)
-            if df is not None and not df.empty:
-                print(f"      ✅  {len(df)} ativos  (CSV legado)")
-                return df, entry_leg["timestamp"], "csv_legado"
-            # Tenta também como JSON
-            df = parse_json_bytes(data)
-            if df is not None and not df.empty:
-                print(f"      ✅  {len(df)} ativos  (JSON legado)")
-                return df, entry_leg["timestamp"], "json_legado"
-    else:
-        print("      Sem entradas legadas descobertas.")
-
-    # ── [4] JSON paginado — API sistemaswebb3 ─────────────────────────────
-    print("  [4] JSON paginado — API sistemaswebb3 …")
+    # ── [1] JSON API (funciona para 2021+) ───────────────────────────────
+    print("  [1] JSON API — sistemaswebb3/GetPortfolioDay …")
     all_dfs, last_ts = [], None
-    for page in range(1, 5):   # até 4 páginas (IBOV ~84 ativos → 1-2 pág.)
+    for page in range(1, 5):
         api_url = b3_api_url(page=page)
-        ts_p    = cdx_find_snapshot(api_url, target)
+        ts = cdx_find_snapshot(api_url, target)
         time.sleep(1)
-        if not ts_p:
+        if not ts:
+            if page == 1:
+                print("      Sem snapshot na janela padrão.")
             break
         if page == 1:
-            snap_dt = datetime.strptime(ts_p[:8], "%Y%m%d")
-            print(f"      snapshot: {ts_p}  ({snap_dt.strftime('%d/%m/%Y')})")
-        last_ts = ts_p
-        data = wayback_get(api_url, ts_p)
+            snap_dt = datetime.strptime(ts[:8], "%Y%m%d")
+            print(f"      snapshot: {ts}  ({snap_dt.strftime('%d/%m/%Y')})")
+        last_ts = ts
+        data = wayback_get(api_url, ts)
         time.sleep(DELAY)
         if not data:
             break
@@ -587,35 +485,107 @@ def fetch_quarter(
         if df_p is None or df_p.empty:
             break
         all_dfs.append(df_p)
-        if len(df_p) < 100:    # última página (menos que pageSize)
+        if len(df_p) < 100:   # menos que pageSize → última página
             break
 
     if all_dfs:
         df = pd.concat(all_dfs, ignore_index=True).drop_duplicates(subset=["codigo"])
-        print(f"      ✅  {len(df)} ativos  (JSON, {len(all_dfs)} pág.)")
+        print(f"      ✅  {len(df)} ativos  (JSON API, {len(all_dfs)} pág.)")
         return df, last_ts, "json_api"
 
-    # ── [5] HTML — página principal B3 ───────────────────────────────────
-    print("  [5] HTML — página principal B3 (janela ±90 dias) …")
-    ts = cdx_find_snapshot(B3_PAGE, target, window_days=90)
-    time.sleep(1)
-    if ts:
-        snap_dt = datetime.strptime(ts[:8], "%Y%m%d")
-        print(f"      snapshot: {ts}  ({snap_dt.strftime('%d/%m/%Y')})")
-        data = wayback_get(B3_PAGE, ts)
+    # ── [2] HTML iframe (descoberto via CDX) ─────────────────────────────
+    print("  [2] HTML iframe — URLs descobertas …")
+    entry = closest_iframe(iframe_entries, target)
+    if entry:
+        snap_dt = datetime.strptime(entry["timestamp"][:8], "%Y%m%d")
+        delta   = abs((snap_dt - target).days)
+        print(f"      snapshot: {entry['timestamp']}  ({snap_dt.strftime('%d/%m/%Y')}, Δ={delta}d)")
+        print(f"      URL: {entry['url'][:75]}")
+        data = wayback_get(entry["url"], entry["timestamp"])
         time.sleep(DELAY)
         if data:
-            df = parse_html_bytes(data)
+            df = parse_table_bs4(data)
             if df is not None and not df.empty:
-                print(f"      ✅  {len(df)} ativos  (HTML parse)")
-                return df, ts, "html_parse"
+                print(f"      ✅  {len(df)} ativos  (HTML iframe CDX)")
+                return df, entry["timestamp"], "html_iframe_cdx"
+            else:
+                print("      Tabela não encontrada no iframe.")
+    else:
+        print("      Sem entradas de iframe descobertas.")
+
+    # ── [3] HTML iframe via página principal → seguir src ────────────────
+    print("  [3] HTML iframe — extraindo src da página principal …")
+    ts_main = cdx_find_snapshot(B3_PAGE, target, window_days=90)
+    time.sleep(1)
+    if ts_main:
+        snap_dt = datetime.strptime(ts_main[:8], "%Y%m%d")
+        print(f"      snapshot página: {ts_main}  ({snap_dt.strftime('%d/%m/%Y')})")
+        main_data = wayback_get(B3_PAGE, ts_main)
+        time.sleep(DELAY)
+        if main_data:
+            iframe_src = extract_iframe_src(main_data)
+            if iframe_src:
+                print(f"      iframe src: {iframe_src[:75]}")
+                # Busca o iframe com timestamp próximo ao da página pai
+                ts_iframe = cdx_find_snapshot(iframe_src, target, window_days=90)
+                time.sleep(1)
+                if ts_iframe:
+                    snap_dt2 = datetime.strptime(ts_iframe[:8], "%Y%m%d")
+                    print(f"      snapshot iframe: {ts_iframe}  ({snap_dt2.strftime('%d/%m/%Y')})")
+                    iframe_data = wayback_get(iframe_src, ts_iframe)
+                    time.sleep(DELAY)
+                    if iframe_data:
+                        df = parse_table_bs4(iframe_data)
+                        if df is not None and not df.empty:
+                            print(f"      ✅  {len(df)} ativos  (HTML iframe seguido)")
+                            return df, ts_iframe, "html_iframe_seguido"
+                        else:
+                            print("      Tabela não encontrada no iframe seguido.")
+                else:
+                    print("      Sem snapshot do iframe no WM.")
+            else:
+                print("      Nenhum iframe encontrado na página principal.")
+
+    # ── [4] HTML iframe direto via CDX (prefixo) ─────────────────────────
+    print("  [4] HTML iframe — CDX ao vivo (prefixo sistemaswebb3/indexPage) …")
+    ts_if = cdx_find_snapshot(
+        IFRAME_PREFIX, target, match_type="prefix",
+        mime_filter="text/html", window_days=90,
+    )
+    time.sleep(1)
+    if ts_if:
+        snap_dt = datetime.strptime(ts_if[:8], "%Y%m%d")
+        print(f"      snapshot: {ts_if}  ({snap_dt.strftime('%d/%m/%Y')})")
+        # Pega a URL real arquivada nesse timestamp
+        rows = cdx_query({
+            "url":       IFRAME_PREFIX,
+            "output":    "json",
+            "from":      ts_if,
+            "to":        ts_if,
+            "fl":        "timestamp,original",
+            "matchType": "prefix",
+            "filter":    ["statuscode:200", "mimetype:text/html"],
+            "limit":     5,
+        })
+        urls_to_try = [r[1] for r in rows] if rows else [IFRAME_PREFIX]
+        for iframe_url in urls_to_try:
+            print(f"      tentando: {iframe_url[:75]}")
+            data = wayback_get(iframe_url, ts_if)
+            time.sleep(DELAY)
+            if data:
+                df = parse_table_bs4(data)
+                if df is not None and not df.empty:
+                    print(f"      ✅  {len(df)} ativos  (HTML iframe CDX ao vivo)")
+                    return df, ts_if, "html_iframe_live"
+    else:
+        print("      Sem snapshot de iframe na janela ±90 dias.")
 
     print(f"  ❌  Sem dados para {label}")
     return None, None, "falhou"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Salvar resultados consolidados
+# Salvar resultados
 # ══════════════════════════════════════════════════════════════════════════════
 
 PRIORITY_COLS = [
@@ -627,18 +597,16 @@ PRIORITY_COLS = [
 
 def save_results(frames: list[pd.DataFrame]) -> None:
     if not frames:
-        print("\n⚠️   Nenhum dado coletado — arquivos não gerados.")
+        print("\n⚠️   Nenhum dado coletado.")
         return
 
     combined = pd.concat(frames, ignore_index=True)
-
     present  = [c for c in PRIORITY_COLS if c in combined.columns]
     rest     = [c for c in combined.columns if c not in present]
     combined = combined[present + rest]
 
     combined.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     print(f"\n  💾  CSV  → {OUTPUT_CSV}")
-
     try:
         combined.to_excel(OUTPUT_XLSX, index=False, engine="openpyxl")
         print(f"  💾  XLSX → {OUTPUT_XLSX}")
@@ -647,25 +615,8 @@ def save_results(frames: list[pd.DataFrame]) -> None:
 
     print(f"\n  Registros  : {len(combined):,}")
     print(f"  Períodos   : {combined['periodo'].nunique()}")
-    print(f"  Estratégias: {combined['estrategia'].value_counts().to_dict()}"
-          if "estrategia" in combined.columns else "")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Resumo de descoberta
-# ══════════════════════════════════════════════════════════════════════════════
-
-def print_discovery_summary(discovered: dict) -> None:
-    print("\n" + "═"*60)
-    print("  URLS DESCOBERTAS NO WAYBACK MACHINE")
-    print("═"*60)
-    for cat, entries in discovered.items():
-        print(f"\n  [{cat}]  {len(entries)} entradas")
-        for e in entries[:8]:
-            snap_dt = datetime.strptime(e["timestamp"][:8], "%Y%m%d").strftime("%d/%m/%Y")
-            print(f"    {snap_dt}  {e['url'][:75]}")
-        if len(entries) > 8:
-            print(f"    … e mais {len(entries)-8} entradas")
+    if "estrategia" in combined.columns:
+        print(f"  Estratégias: {combined.groupby('estrategia')['periodo'].nunique().to_dict()}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -673,18 +624,14 @@ def print_discovery_summary(discovered: dict) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--skip-existing", action="store_true",
                    help="Pula quadrimestres cujo CSV individual já existe")
     p.add_argument("--only", metavar="LABEL",
-                   help="Coleta apenas um período (ex: 2021-Q2)")
-    p.add_argument("--discover-only", action="store_true",
-                   help="Executa só a fase de descoberta e exibe resultado")
+                   help="Coleta apenas um período (ex: 2019-Q1)")
     p.add_argument("--rediscover", action="store_true",
-                   help="Força nova varredura CDX (ignora cache)")
+                   help="Refaz a varredura CDX dos iframes (ignora cache)")
     return p.parse_args()
 
 
@@ -694,17 +641,28 @@ def main() -> None:
 
     print("═"*60)
     print("  IBOV — Composição Quadrimestral 2018-2025")
-    print("  Wayback Machine  |  v2 — download direto CSV")
+    print("  Wayback Machine  |  v3 — HTML iframe + JSON API")
     print("═"*60)
 
-    # ── Fase 1: Descoberta CDX ────────────────────────────────────────────
-    discovered = discover_ibov_urls(force=args.rediscover)
-    print_discovery_summary(discovered)
+    # Fase de descoberta: mapeia URLs de iframe no WM
+    iframe_entries = discover_iframe_urls(force=args.rediscover)
 
-    if args.discover_only:
-        sys.exit(0)
+    if iframe_entries:
+        print(f"\n  Iframes no WM: {len(iframe_entries)} URLs únicas")
+        # Mostra intervalo de datas coberto
+        dts = sorted(e["timestamp"][:8] for e in iframe_entries)
+        d0  = datetime.strptime(dts[0],  "%Y%m%d").strftime("%d/%m/%Y")
+        d1  = datetime.strptime(dts[-1], "%Y%m%d").strftime("%d/%m/%Y")
+        print(f"  Cobertura   : {d0} → {d1}")
+        # Mostra exemplos de URLs únicas
+        unique_urls = list({e["url"] for e in iframe_entries})[:5]
+        print("  Exemplos de URLs:")
+        for u in unique_urls:
+            print(f"    {u[:78]}")
+    else:
+        print("\n  ⚠️   Nenhuma URL de iframe encontrada no WM.")
 
-    # ── Fase 2: Coleta quadrimestral ──────────────────────────────────────
+    # Coleta
     quads = QUADRIMESTRES
     if args.only:
         quads = [q for q in quads if q["label"] == args.only]
@@ -719,7 +677,6 @@ def main() -> None:
     for quad in quads:
         ind_csv = os.path.join(OUTPUT_DIR, f"ibov_{quad['label']}.csv")
 
-        # Modo incremental
         if args.skip_existing and os.path.isfile(ind_csv):
             print(f"\n  ⏭️   {quad['label']}  — já coletado, pulando.")
             df_ex = pd.read_csv(ind_csv)
@@ -729,11 +686,10 @@ def main() -> None:
                 "n_ativos":   len(df_ex),
                 "status":     "existente",
                 "estrategia": "—",
-                "snapshot":   df_ex.get("snapshot_ts", pd.Series(["?"])).iloc[0],
             })
             continue
 
-        df, ts, estrategia = fetch_quarter(quad, discovered)
+        df, ts, estrategia = fetch_quarter(quad, iframe_entries)
         ok = df is not None and not df.empty
 
         summary.append({
@@ -756,22 +712,21 @@ def main() -> None:
                 datetime.strptime(ts[:8], "%Y%m%d").strftime("%d/%m/%Y") if ts else ""
             )
             df.to_csv(ind_csv, index=False, encoding="utf-8-sig")
-            print(f"      📁  Salvo: {ind_csv}")
+            print(f"      📁  {ind_csv}")
             all_frames.append(df)
 
         time.sleep(DELAY)
 
-    # ── Resumo final ──────────────────────────────────────────────────────
+    # Resumo
     print("\n" + "═"*60)
     print("  RESUMO DA COLETA")
     print("═"*60)
     df_summ = pd.DataFrame(summary)
     print(df_summ.to_string(index=False))
 
-    ok_n   = df_summ[df_summ["status"].isin(["ok", "existente"])].shape[0]
-    fail_n = len(summary) - ok_n
+    ok_n = df_summ[df_summ["status"].isin(["ok", "existente"])].shape[0]
     print(f"\n  ✅  Coletados : {ok_n}/{len(summary)}")
-    print(f"  ❌  Falharam  : {fail_n}/{len(summary)}")
+    print(f"  ❌  Falharam  : {len(summary)-ok_n}/{len(summary)}")
 
     save_results(all_frames)
 

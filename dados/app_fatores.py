@@ -161,11 +161,36 @@ def buscar_precos(ticker: str, datas: tuple) -> pd.DataFrame:
 # Cálculo dos fatores
 # ===========================================================================
 
+def _normalizar_escala_acoes(qt, pl, preco, limite_pb=0.05):
+    """
+    Corrige a escala de qt_acoes. A composição de capital da CVM às vezes informa
+    as ações em MILHARES (o arquivo não tem coluna de escala), deixando qt ~1000x
+    menor e inflando LPA/VPA/Graham. Detecta pelo P/B implícito (market_cap / PL):
+    enquanto < limite_pb, multiplica qt por 1000 (até 2x). Só ajusta linhas com
+    PL > 0 e preço disponível.
+    """
+    qt    = np.asarray(qt,    dtype="float64").copy()
+    pl    = np.asarray(pl,    dtype="float64")
+    preco = np.asarray(preco, dtype="float64")
+    for _ in range(2):
+        pb = np.where(
+            (pl > 0) & np.isfinite(preco) & np.isfinite(qt) & (qt > 0),
+            (preco * qt) / pl, np.nan,
+        )
+        corrige = np.isfinite(pb) & (pb < limite_pb)
+        qt = np.where(corrige, qt * 1000.0, qt)
+    return qt
+
+
 def _cagr_5anos(df: pd.DataFrame) -> pd.DataFrame:
-    """CAGR de lucro e receita: dezembro X vs dezembro X-5, por CNPJ + ano."""
+    """
+    CAGR de lucro e receita: dezembro X vs dezembro X-5. Retorna
+    [CNPJ_CIA, data_cagr, cagr_lucro, cagr_receita] (data_cagr = 31/dez do ano X)
+    para propagar via merge_asof (carry-forward).
+    """
     dez = df[df["DT_FIM_EXERC"].dt.month == 12].copy()
     if dez.empty:
-        return pd.DataFrame(columns=["CNPJ_CIA", "ano", "cagr_lucro", "cagr_receita"])
+        return pd.DataFrame(columns=["CNPJ_CIA", "data_cagr", "cagr_lucro", "cagr_receita"])
     dez["ano"] = dez["DT_FIM_EXERC"].dt.year
     atual = dez.drop_duplicates(["CNPJ_CIA", "ano"])
     base = atual.rename(columns={"ano": "ano_base"})
@@ -184,7 +209,8 @@ def _cagr_5anos(df: pd.DataFrame) -> pd.DataFrame:
         res["cagr_lucro"] = _cagr(m["ll_anualizado"], m["ll_base"])
     if "rec_base" in m:
         res["cagr_receita"] = _cagr(m["receita_anualizada"], m["rec_base"])
-    return res
+    res["data_cagr"] = pd.to_datetime(res["ano"].astype(str) + "-12-31")
+    return res.drop(columns=["ano"])
 
 
 def calcular_fatores(base: pd.DataFrame, df_precos: pd.DataFrame,
@@ -200,12 +226,22 @@ def calcular_fatores(base: pd.DataFrame, df_precos: pd.DataFrame,
     if "preco" not in df.columns:
         df["preco"] = np.nan
 
+    # Corrige escala de qt_acoes (composição às vezes em MILHARES) via P/B implícito
+    if "qt_acoes" in df.columns and "pl" in df.columns:
+        df["qt_acoes"] = _normalizar_escala_acoes(df["qt_acoes"], df["pl"], df["preco"])
+
     g = lambda c: df[c] if c in df.columns else pd.Series(np.nan, index=df.index)
 
-    # CAGR (precisa de histórico completo) → mescla por CNPJ + ano
-    if ("cagr_lucro" in fatores or "cagr_receita" in fatores) and "ano" not in df.columns:
-        df["ano"] = df["DT_FIM_EXERC"].dt.year
-        df = df.merge(_cagr_5anos(df), on=["CNPJ_CIA", "ano"], how="left")
+    # CAGR (usa histórico completo): calculado em dezembro e propagado aos
+    # trimestres seguintes via merge_asof (carry-forward; só dezembros passados).
+    if "cagr_lucro" in fatores or "cagr_receita" in fatores:
+        cagr = _cagr_5anos(df).dropna(subset=["data_cagr"]).sort_values("data_cagr")
+        df = df.sort_values("DT_FIM_EXERC")
+        if not cagr.empty:
+            df = pd.merge_asof(
+                df, cagr, left_on="DT_FIM_EXERC", right_on="data_cagr",
+                by="CNPJ_CIA", direction="backward",
+            ).drop(columns=["data_cagr"])
 
     saida = {}
     qt = g("qt_acoes")
@@ -261,6 +297,16 @@ def calcular_fatores(base: pd.DataFrame, df_precos: pd.DataFrame,
         elif f == "margem_seguranca":
             saida["margem_seguranca"] = np.where(
                 (graham > 0) & preco.notna(), (graham - preco) / graham, np.nan)
+
+    # Métricas que não se aplicam a instituições financeiras → NaN
+    if "is_financeiro" in df.columns:
+        fin = df["is_financeiro"].astype(str).str.strip().str.lower().isin(
+            ["true", "1", "1.0"]).to_numpy()
+    else:
+        fin = np.zeros(len(df), dtype=bool)
+    for col in ("roic", "dl_ebitda", "ev", "ev_ebit"):
+        if col in saida:
+            saida[col] = np.where(fin, np.nan, np.asarray(saida[col], dtype="float64"))
 
     ident = ["ticker", "DENOM_CIA"]
     if "SETOR_ATIV" in df.columns:
